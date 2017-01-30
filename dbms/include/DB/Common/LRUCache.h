@@ -8,6 +8,8 @@
 #include <mutex>
 #include <DB/Common/Exception.h>
 #include <common/logger_useful.h>
+#include <thread>
+#include <iostream>
 
 
 namespace DB
@@ -94,6 +96,79 @@ public:
 		removeOverflow(cell.timestamp);
 	}
 
+    template<typename Create>
+    MappedPtr getOrSet(const Key & key, Create&& create)
+    {
+        InsertTokenHolder token_holder;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            auto cell_it = cells.find(key);
+            if (cell_it != cells.end())
+            {
+                ++hits;
+                Cell & cell = cell_it->second;
+                updateCellTimestamp(cell);
+                queue.splice(queue.end(), queue, cell.queue_iterator);
+
+                return cell.value;
+            }
+
+            auto res = insert_tokens.emplace(std::piecewise_construct,
+                                             std::forward_as_tuple(key),
+                                             std::forward_as_tuple(std::make_shared<InsertToken>(*this)));
+            token_holder.acquire(&res.first->first, res.first->second);
+        }
+
+        InsertToken * token = token_holder.token.get();
+
+        std::lock_guard<std::mutex> token_lock(token->mutex);
+
+        if (token->cleaned_up)
+            token_holder.cleaned_up = true;
+
+        if (token->value)
+        {
+            ++hits;
+
+            return token->value;
+        }
+
+        ++misses;
+        token->value = create();
+
+        std::lock_guard<std::mutex> lock(mutex);
+
+        auto res = cells.emplace(std::piecewise_construct,
+                                 std::forward_as_tuple(key),
+                                 std::forward_as_tuple());
+
+        Cell & cell = res.first->second;
+        bool inserted = res.second;
+
+        if (inserted)
+        {
+            cell.queue_iterator = queue.insert(queue.end(), key);
+        }
+        else
+        {
+            current_size -= cell.size;
+            queue.splice(queue.end(), queue, cell.queue_iterator);
+        }
+
+        cell.value = token->value;
+        cell.size = cell.value ? weight_function(*cell.value) : 0;
+        current_size += cell.size;
+        updateCellTimestamp(cell);
+
+        removeOverflow(cell.timestamp);
+
+        if (!token->cleaned_up)
+            token_holder.cleanup();
+
+        return cell.value;
+    }
+
 	void getStats(size_t & out_hits, size_t & out_misses) const
 	{
 		std::lock_guard<std::mutex> lock(mutex);
@@ -117,7 +192,8 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(mutex);
 		queue.clear();
-		cells.clear();
+                cells.clear();
+                insert_tokens.clear();
 		current_size = 0;
 		hits = 0;
 		misses = 0;
@@ -148,7 +224,78 @@ private:
 		Timestamp timestamp;
 	};
 
-	using Cells = std::unordered_map<Key, Cell, HashFunction>;
+        struct InsertToken
+        {
+            InsertToken(LRUCache & cache_) : cache(cache_) {}
+
+            std::mutex mutex;
+            bool cleaned_up = false;
+            MappedPtr value;
+
+            LRUCache & cache;
+            size_t refcount = 0;
+        };
+
+        struct InsertTokenHolder
+        {
+            bool cleaned_up = false;
+            const Key * key = nullptr;
+            std::shared_ptr<InsertToken> token;
+
+            InsertTokenHolder() = default;
+
+            /// Assumed that the cache mutex is locked here.
+            void acquire(const Key * key_, const std::shared_ptr<InsertToken> & token_)
+            {
+                key = key_;
+                token = token_;
+                ++token->refcount;
+                std::cerr << std::this_thread::get_id() << " ACQUIRED TOKEN REFCOUNT: " << token->refcount << std::endl;
+            }
+
+            /// Assumed that both the token mutex and the cache mutex are locked here.
+            void cleanup()
+            {
+                auto it = token->cache.insert_tokens.find(*key);
+                token->cache.insert_tokens.erase(it);
+                token->cleaned_up = true;
+                cleaned_up = true;
+                std::cerr << std::this_thread::get_id() << " CLEANED UP" << std::endl;
+            }
+
+            ~InsertTokenHolder()
+            {
+                if (!token)
+                    return;
+
+                if (cleaned_up)
+                {
+                    std::cerr << std::this_thread::get_id() << " TOKEN ALREADY CLEANED UP 1" << std::endl;
+                    return;
+                }
+
+                std::lock_guard<std::mutex> token_lock(token->mutex);
+
+                if (token->cleaned_up)
+                {
+                    std::cerr << std::this_thread::get_id() << " TOKEN ALREADY CLEANED UP 2" << std::endl;
+                    return;
+                }
+
+                std::lock_guard<std::mutex> cache_lock(token->cache.mutex);
+
+                --token->refcount;
+                std::cerr << std::this_thread::get_id() << " RELEASED TOKEN REFCOUNT: " << token->refcount << std::endl;
+                if (token->refcount == 0)
+                    cleanup();
+            }
+        };
+
+    friend struct InsertTokenHolder;
+
+    std::unordered_map<Key, std::shared_ptr<InsertToken>, HashFunction> insert_tokens;
+
+        using Cells = std::unordered_map<Key, Cell, HashFunction>;
 
 	LRUQueue queue;
 	Cells cells;
